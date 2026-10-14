@@ -1,1 +1,1 @@
-# projeto-academia-prot-tipo
+# projeto-academia-prototipo
