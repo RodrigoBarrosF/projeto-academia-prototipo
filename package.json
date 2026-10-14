@@ -1,0 +1,12 @@
+﻿{
+  "name": "dry-fit",
+  "version": "1.0.0",
+  "private": true,
+  "engines": { "node": ">=24.15.0 <25" },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server/index.js",
+    "test": "node --test domain.test.js server/server.test.js",
+    "create-user": "node --env-file-if-exists=.env server/manage.js create-user",
+    "backup": "node --env-file-if-exists=.env server/manage.js backup"
+  }
+}

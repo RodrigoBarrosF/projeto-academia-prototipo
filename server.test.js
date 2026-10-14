@@ -1,0 +1,67 @@
+﻿const test=require('node:test');
+const assert=require('node:assert/strict');
+const {createApp}=require('./index');
+const {passwordHash,digest}=require('./store');
+const {randomUUID}=require('node:crypto');
+test('API: autenticação, isolamento, chat, pagamentos e presença',async t=>{
+ const app=createApp({database:':memory:',origin:'http://localhost:3000'});
+ await new Promise(r=>app.server.listen(0,'127.0.0.1',r));t.after(()=>app.close());
+ const base='http://127.0.0.1:'+app.server.address().port;
+ const password='Test-only-long-password-2026',hash=await passwordHash(password);
+ for(const [id,role,cpf]of [['admin','admin','01234567890'],['personal','personal','98765432100'],['outsider','personal','11144477735']]){const u={id,name:id,role,cpf,personalId:null,schedule:[],subscription:null};app.store.db.prepare('INSERT INTO users VALUES(?,?,?,?)').run(id,cpf,hash,JSON.stringify(u));}
+ function browser(){let cookie='',csrf='';return async(route,data,extra={})=>{const res=await fetch(base+'/api'+route,{method:data===undefined?'GET':'POST',headers:{...(data===undefined?{}:{'Content-Type':'application/json',Origin:'http://localhost:3000','X-CSRF-Token':csrf}),Cookie:cookie,...extra},body:data===undefined?undefined:JSON.stringify(data)});const body=await res.json();if(res.headers.get('set-cookie'))cookie=res.headers.get('set-cookie').split(';')[0];if(body.csrf)csrf=body.csrf;return {status:res.status,body,cookie:res.headers.get('set-cookie')};};}
+ const aluno=browser(),other=browser(),admin=browser(),personal=browser(),outsider=browser();
+ assert.equal((await aluno('/state')).status,401);
+ assert.equal((await aluno('/auth/register',{name:'Ana Teste',cpf:'52998224725',password},{Origin:'https://evil.example'})).status,403);
+ const reg=await aluno('/auth/register',{name:'Ana Teste',cpf:'52998224725',password,role:'admin'});assert.equal(reg.status,201);assert.equal(reg.body.user.role,'client');assert.match(reg.cookie,/HttpOnly/);assert.match(reg.cookie,/SameSite=Strict/);const clientId=reg.body.user.id;
+ const reg2=await other('/auth/register',{name:'Carla Teste',cpf:'12345678909',password});assert.equal(reg2.status,201);
+ for(const [b,cpf,role]of [[admin,'01234567890','admin'],[personal,'98765432100','personal'],[outsider,'11144477735','personal']])assert.equal((await b('/auth/login',{cpf,password,role})).status,200);
+ assert.equal((await admin('/assign',{userId:clientId,personalId:'personal'})).status,200);
+ const snap=await aluno('/state');assert.equal(snap.body.state.users.some(u=>u.id===reg2.body.user.id),false);assert.equal(snap.body.state.users.some(u=>u.role==='admin'),false);assert.equal(JSON.stringify(snap.body).includes('password_hash'),false);
+ assert.equal((await aluno('/chat',{clientId,text:'Olá'})).status,201);
+ assert.equal((await outsider('/chat',{clientId,text:'Invadir'})).status,403);
+ assert.equal((await other('/chat',{clientId,text:'Invadir'})).status,403);
+ assert.equal((await personal('/chat',{clientId,text:'Resposta'})).status,201);
+ assert.equal((await aluno('/state')).body.state.messages.length,2);
+ assert.equal((await aluno('/schedule',{userId:clientId,days:[1]})).status,403);
+ assert.equal((await personal('/schedule',{userId:clientId,days:[1,2]})).status,200);
+ const order=await aluno('/orders',{planId:'performance',amount:0});assert.equal(order.status,201);assert.equal(order.body.order.amount,149.9);assert.equal(app.store.getUser(clientId).subscription,null);
+ assert.equal((await aluno('/orders/confirm',{orderId:order.body.order.id,reference:'fraude'})).status,403);
+ assert.equal((await admin('/orders/confirm',{orderId:order.body.order.id,reference:'recibo teste'})).status,200);
+ const end=app.store.getUser(clientId).subscription.end;
+ await admin('/orders/confirm',{orderId:order.body.order.id,reference:'duplicado'});assert.equal(app.store.getUser(clientId).subscription.end,end);
+ assert.equal((await aluno('/attendance/manual',{userId:clientId,reason:'fraude'})).status,403);
+ assert.equal((await admin('/attendance/manual',{userId:clientId,reason:'Recepção conferiu'})).body.ok,true);
+ assert.equal((await admin('/attendance/manual',{userId:clientId,reason:'Recepção conferiu'})).body.ok,false);
+ assert.equal((await aluno('/chat',{clientId,text:'teste'},{'X-CSRF-Token':'wrong'})).status,403);
+ assert.equal((await aluno('/gate',{})).status,503);
+ assert.equal((await aluno('/auth/logout',{})).status,200);assert.equal((await aluno('/state')).status,401);
+ const again=await aluno('/auth/login',{cpf:'52998224725',password,role:'client'});assert.equal(again.status,200);
+ const token=randomUUID();app.store.db.prepare('INSERT INTO resets VALUES(?,?,?)').run(digest(token),clientId,Date.now()+10000);
+ assert.equal((await aluno('/auth/reset',{token,password:'new-long-password-2026'})).status,200);
+ assert.equal((await aluno('/state')).status,401);
+ assert.equal((await aluno('/auth/reset',{token,password:'another-long-password'})).status,400);
+ assert.equal((await fetch(base+'/server/store.js')).status,404);
+ assert.equal((await fetch(base+'/.env')).status,404);
+ assert.equal((await fetch(base+'/')).status,200);assert.equal((await fetch(base+'/demo/')).status,200);
+});
+test('produção recusa origem HTTP',()=>assert.throws(()=>createApp({production:true,origin:'http://localhost:3000',database:':memory:'}),/HTTPS/));
+test('perfil e preferências não alteram privilégios; senha revoga outras sessões',async t=>{
+ const app=createApp({database:':memory:',origin:'http://localhost:3000'});await new Promise(r=>app.server.listen(0,'127.0.0.1',r));t.after(()=>app.close());
+ const base='http://127.0.0.1:'+app.server.address().port;
+ function client(){let cookie='',csrf='';return async(route,data)=>{const res=await fetch(base+'/api'+route,{method:data===undefined?'GET':'POST',headers:{Origin:'http://localhost:3000','Content-Type':'application/json',Cookie:cookie,'X-CSRF-Token':csrf},body:data===undefined?undefined:JSON.stringify(data)});const body=await res.json();if(res.headers.get('set-cookie'))cookie=res.headers.get('set-cookie').split(';')[0];if(body.csrf)csrf=body.csrf;return {status:res.status,body};};}
+ const first=client(),second=client(),password='profile-test-password-2026';
+ const reg=await first('/auth/register',{name:'Ana Teste',cpf:'52998224725',password});assert.equal(reg.status,201);
+ await second('/auth/login',{cpf:'52998224725',password,role:'client'});
+ const profile=await first('/profile',{name:'Ana Atualizada',email:'ana@example.com',phone:'65999999999',role:'admin',cpf:'12345678909'});
+ assert.equal(profile.status,200);assert.equal(profile.body.user.role,'client');assert.equal(app.store.getUser(reg.body.user.id).cpf,'52998224725');assert.equal(profile.body.user.email,'ana@example.com');
+ assert.equal((await first('/profile',{name:'Ana',email:'invalid',phone:''})).status,400);
+ assert.equal((await first('/preferences',{language:'en',theme:'light',largeText:true,reducedMotion:false})).status,200);
+ assert.equal((await second('/auth/me')).body.user.preferences.language,'en');
+ assert.equal((await first('/preferences',{language:'fake',theme:'dark',largeText:true,reducedMotion:false})).status,400);
+ assert.equal((await first('/auth/password',{currentPassword:'wrong-password',newPassword:'replacement-password-2026'})).status,400);
+ assert.equal((await first('/auth/password',{currentPassword:password,newPassword:'replacement-password-2026'})).status,200);
+ assert.equal((await first('/state')).status,200);assert.equal((await second('/state')).status,401);
+ assert.equal((await second('/auth/login',{cpf:'52998224725',password,role:'client'})).status,401);
+ assert.equal((await second('/auth/login',{cpf:'52998224725',password:'replacement-password-2026',role:'client'})).status,200);
+});
